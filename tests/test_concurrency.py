@@ -129,3 +129,53 @@ def test_concurrent_queries_never_see_half_commit(client):
         t.join(timeout=10)
 
     assert not failures
+
+
+def test_concurrent_corrections_serialize_with_stale_rejections():
+    # 一批并发更正：同一 base_version 只有一个成功，其余整批失败且不留履历；版本恰好 +1
+    from app.main import db, service
+
+    service.submit_points(
+        "ct",
+        {
+            "points": [
+                {"point_id": f"p{i}", "ts": f"2026-09-30T10:0{i}:00Z", "x": float(i), "y": 1.0}
+                for i in range(8)
+            ]
+        },
+    )
+    results = []
+
+    def correct(pid: str) -> None:
+        try:
+            r = service.correct_points(
+                "ct",
+                {
+                    "base_version": 1,
+                    "reason": f"revoke {pid}",
+                    "items": [{"point_id": pid, "op": "revoke"}],
+                },
+            )
+            results.append(("ok", r["track_version"]))
+        except Exception as exc:  # noqa: BLE001
+            results.append(("conflict", str(exc)[:20]))
+
+    threads = [
+        threading.Thread(target=correct, args=(f"p{i}",))
+        for i in range(8)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    oks = [r for r in results if r[0] == "ok"]
+    assert len(oks) == 1
+    assert oks[0][1] == 2  # 只有一个事务推进版本
+    assert service.get_trip_version_info("ct")["track_version"] == 2
+    with db.read_view() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) AS c FROM point_corrections WHERE trip_id = 'ct'"
+        ).fetchone()["c"]
+    assert n == 1  # 失败整批不留履历
+    assert service.get_trip_version_info("ct")["active_point_count"] == 7

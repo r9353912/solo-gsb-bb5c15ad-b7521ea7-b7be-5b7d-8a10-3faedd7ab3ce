@@ -1,7 +1,7 @@
 """HTTP 请求/响应模型（Pydantic；坐标数值校验在服务层做有限性检查）。"""
 from __future__ import annotations
 
-from typing import List
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -44,3 +44,30 @@ class PointBatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     points: List[TrajectoryPoint] = Field(..., min_length=1)
+
+
+class CorrectionItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    point_id: str = Field(..., min_length=1, description="被更正的点 ID（批内互异）")
+    op: Literal["revoke", "update"] = Field(
+        ..., description="revoke=撤销该点；update=给出更正后的带时区时刻与有限平面坐标"
+    )
+    ts: Optional[str] = Field(default=None, description="op=update 时必填：UTC ISO 8601，必须带时区")
+    x: Optional[float] = Field(default=None, description="op=update 时必填：有限平面米制坐标")
+    y: Optional[float] = Field(default=None, description="op=update 时必填：有限平面米制坐标")
+
+
+class PointCorrectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_version: int = Field(
+        ..., ge=0, description="作业人员所见轨迹版本；必须与当前版本一致（首批上传后版本 1 起步）"
+    )
+    reason: str = Field(..., min_length=1, description="非空更正原因")
+    items: List[CorrectionItem] = Field(..., min_length=1, description="一组互异 point_id 的更正项")
+    correction_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description="可选客户幂等令牌：同车次同令牌须同内容，重放返回首次结果且不推进版本",
+    )

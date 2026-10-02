@@ -43,4 +43,24 @@ def test_records_survive_database_reopen():
     z = result["zones"][0]
     assert z["crossed"] is True
     assert z["total_duration_sec"] == 40.0
+
+    # 更正也持久化：撤销中间点后重启，版本/履历/有效点集保持
+    corr = svc2.correct_points(
+        "persist-trip",
+        {
+            "base_version": 1,
+            "reason": "现场误录",
+            "items": [{"point_id": "q2", "op": "revoke"}],
+        },
+    )
+    assert corr["track_version"] == 2
     db2.close()
+
+    db3 = Database(settings)
+    svc3 = AuditService(db3)
+    assert svc3.get_trip_version_info("persist-trip")["track_version"] == 2
+    hist = svc3.list_point_corrections("persist-trip")
+    assert len(hist["corrections"]) == 1
+    assert hist["corrections"][0]["changes"][0]["point_id"] == "q2"
+    assert svc3.get_trip_version_info("persist-trip")["active_point_count"] == 2
+    db3.close()
