@@ -1,7 +1,7 @@
 """HTTP 请求/响应模型（Pydantic；坐标数值校验在服务层做有限性检查）。"""
 from __future__ import annotations
 
-from typing import List
+from typing import Annotated, List, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -44,3 +44,39 @@ class PointBatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     points: List[TrajectoryPoint] = Field(..., min_length=1)
+
+
+class RevokeItem(BaseModel):
+    """撤销项：该 point_id 从车次有效点集中永久移除。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["revoke"]
+    point_id: str = Field(..., min_length=1)
+
+
+class UpdateItem(BaseModel):
+    """更正项：将该 point_id 改写为新的 UTC 时刻与有限平面坐标。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["update"]
+    point_id: str = Field(..., min_length=1)
+    ts: str = Field(..., description="更正后的 UTC ISO 8601 时刻，必须带时区")
+    x: float
+    y: float
+
+
+CorrectionItem = Annotated[Union[RevokeItem, UpdateItem], Field(discriminator="action")]
+
+
+class CorrectionBatch(BaseModel):
+    """现场采集点更正批：整组在同一事务内核对并生效。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_version: int = Field(
+        ..., ge=0, description="作业人员所见的当前轨迹版本；须与库中当前版本一致"
+    )
+    reason: str = Field(..., min_length=1, description="非空更正原因")
+    items: List[CorrectionItem] = Field(..., min_length=1)

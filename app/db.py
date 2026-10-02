@@ -1,12 +1,20 @@
-"""SQLite 持久层：危险区不可变修订版本、生效时段、轨迹点。
+"""SQLite 持久层：危险区不可变修订版本、生效时段、轨迹点与现场点更正。
 
-修订模型
---------
+修订模型（区域）
+----------------
 - 每次登记（含同 ID 覆盖更新）向 ``zone_revisions`` 追加一行不可变记录，
   ``revision`` 为 SQLite AUTOINCREMENT 分配的全局递增修订号（登记事务内原子产生）。
 - 截至修订号 R，每个区取其 ``revision <= R`` 的最后一行；指定版本中尚未登记的区无行、不参与核算。
 - 旧库（zones / zone_windows 两张表）首次启动时一次性迁移为基线版本 revision=1..，
   迁移后删除旧表；不推断迁移前历史。
+
+轨迹版本与更正（车次）
+----------------------
+- ``trip_versions`` 每车次一行记录当前轨迹版本：升级前已有点的车次首次启动时迁移为
+  版本 0 基线；之后每批真正录入新点或每批成功更正各推进一次，纯幂等重传不推进。
+- ``revoked_points`` 永久登记已撤销点（撤销即从 points 有效集移除），已撤销 ID 不得经上传重用。
+- ``point_corrections`` 为只追加、不可改的前后值履历（action=update/revoke、前后时刻坐标、
+  生效版本与更正时间），仅在整组更正成功的同一事务内写入。
 
 并发
 ----
@@ -23,6 +31,7 @@ import json
 import sqlite3
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -54,6 +63,43 @@ CREATE TABLE IF NOT EXISTS points (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_points_trip_ts
     ON points(trip_id, ts_epoch);
 CREATE INDEX IF NOT EXISTS idx_points_trip ON points(trip_id, ts_epoch);
+
+-- 车次轨迹版本：每车次一行。既有车次（本表功能上线前已有点）首次启动时迁移为 version=0 基线；
+-- 此后每批真正录入新点或每批成功更正各推进一次，纯幂等重传不推进。
+CREATE TABLE IF NOT EXISTS trip_versions (
+    trip_id    TEXT PRIMARY KEY,
+    version    INTEGER NOT NULL,          -- 当前轨迹版本号（基线为 0）
+    updated_at TEXT NOT NULL
+);
+
+-- 已撤销点：撤销即从 points 有效集移除并在此永久登记；已撤销 ID 不得经上传重用。
+CREATE TABLE IF NOT EXISTS revoked_points (
+    trip_id    TEXT NOT NULL,
+    point_id   TEXT NOT NULL,
+    version    INTEGER NOT NULL,          -- 撤销所在批次成功后的轨迹版本
+    reason     TEXT NOT NULL,
+    revoked_at TEXT NOT NULL,
+    PRIMARY KEY (trip_id, point_id)
+);
+
+-- 点更正履历：只追加、不可改。每次成功更正对每个受影响点追加一行（带前后值）。
+CREATE TABLE IF NOT EXISTS point_corrections (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    trip_id        TEXT NOT NULL,
+    version        INTEGER NOT NULL,       -- 该批更正成功后的新版本号
+    reason         TEXT NOT NULL,
+    point_id       TEXT NOT NULL,
+    action         TEXT NOT NULL,          -- update | revoke
+    before_ts_epoch REAL NOT NULL,
+    before_x       REAL NOT NULL,
+    before_y       REAL NOT NULL,
+    after_ts_epoch REAL,                   -- revoke 时为 NULL
+    after_x        REAL,
+    after_y        REAL,
+    corrected_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_point_corrections_trip
+    ON point_corrections(trip_id, version, id);
 """
 
 _LEGACY_TABLES = ("zones", "zone_windows")
@@ -86,6 +132,7 @@ class Database:
         with self._lock:
             self._conn.executescript(_SCHEMA)
             self._migrate_legacy_zones(self._conn)
+            self._baseline_existing_trips(self._conn)
 
     def _table_exists(self, conn: sqlite3.Connection, name: str) -> bool:
         cur = conn.execute(
@@ -142,6 +189,19 @@ class Database:
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+    def _baseline_existing_trips(self, conn: sqlite3.Connection) -> None:
+        """既有车次（功能上线前已有点）一次性登记为轨迹版本 0 基线。
+
+        幂等：trip_versions 已存在的车次不重复登记；新功能上线后首次上传的车次
+        在上传事务内直接建立版本 1，不经过此路径。
+        """
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        conn.execute(
+            "INSERT OR IGNORE INTO trip_versions(trip_id, version, updated_at) "
+            "SELECT DISTINCT trip_id, 0, ? FROM points",
+            (now_iso,),
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -331,9 +391,109 @@ class Database:
             rows,
         )
 
+    def delete_points(self, conn: sqlite3.Connection, trip_id: str, point_ids: List[str]) -> None:
+        conn.executemany(
+            "DELETE FROM points WHERE trip_id = ? AND point_id = ?",
+            [(trip_id, pid) for pid in point_ids],
+        )
+
+    # ----- 车次轨迹版本 ------------------------------------------------------
+
+    @staticmethod
+    def _trip_version_row(conn: sqlite3.Connection, trip_id: str) -> Optional[sqlite3.Row]:
+        cur = conn.execute(
+            "SELECT * FROM trip_versions WHERE trip_id = ?", (trip_id,)
+        )
+        return cur.fetchone()
+
+    def get_trip_version(self, trip_id: str) -> Optional[int]:
+        """当前轨迹版本号；车次从未存在时为 None。"""
+        with self._lock:
+            row = self._trip_version_row(self._conn, trip_id)
+            return None if row is None else int(row["version"])
+
+    @staticmethod
+    def upsert_trip_version(
+        conn: sqlite3.Connection, trip_id: str, version: int, updated_iso: str
+    ) -> None:
+        conn.execute(
+            "INSERT INTO trip_versions(trip_id, version, updated_at) VALUES (?,?,?) "
+            "ON CONFLICT(trip_id) DO UPDATE SET version=excluded.version, "
+            "updated_at=excluded.updated_at",
+            (trip_id, version, updated_iso),
+        )
+
+    # ----- 已撤销点 ----------------------------------------------------------
+
+    @staticmethod
+    def _revoked_row(conn: sqlite3.Connection, trip_id: str, point_id: str) -> Optional[sqlite3.Row]:
+        cur = conn.execute(
+            "SELECT * FROM revoked_points WHERE trip_id = ? AND point_id = ?",
+            (trip_id, point_id),
+        )
+        return cur.fetchone()
+
+    def is_point_revoked(self, trip_id: str, point_id: str) -> bool:
+        with self._lock:
+            return self._revoked_row(self._conn, trip_id, point_id) is not None
+
+    def list_revoked_ids(self, conn: sqlite3.Connection, trip_id: str) -> List[str]:
+        return [
+            r["point_id"]
+            for r in conn.execute(
+                "SELECT point_id FROM revoked_points WHERE trip_id = ? ORDER BY point_id",
+                (trip_id,),
+            )
+        ]
+
+    @staticmethod
+    def insert_revoked_points(
+        conn: sqlite3.Connection,
+        trip_id: str,
+        point_ids: List[str],
+        version: int,
+        reason: str,
+        revoked_iso: str,
+    ) -> None:
+        conn.executemany(
+            "INSERT INTO revoked_points(trip_id, point_id, version, reason, revoked_at) "
+            "VALUES (?,?,?,?,?)",
+            [(trip_id, pid, version, reason, revoked_iso) for pid in point_ids],
+        )
+
+    # ----- 点更正履历 --------------------------------------------------------
+
+    @staticmethod
+    def insert_point_corrections(
+        conn: sqlite3.Connection, rows: List[Tuple[Any, ...]]
+    ) -> None:
+        conn.executemany(
+            "INSERT INTO point_corrections"
+            "(trip_id, version, reason, point_id, action, "
+            " before_ts_epoch, before_x, before_y, after_ts_epoch, after_x, after_y, corrected_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
+
+    @staticmethod
+    def list_point_correction_rows(
+        conn: sqlite3.Connection, trip_id: str
+    ) -> List[sqlite3.Row]:
+        return list(
+            conn.execute(
+                "SELECT * FROM point_corrections WHERE trip_id = ? "
+                "ORDER BY version, id",
+                (trip_id,),
+            )
+        )
+
     def clear_all_for_tests(self) -> None:
         """测试专用：清空业务数据并重置修订号序列。"""
         with self.transaction() as conn:
             conn.execute("DELETE FROM points")
             conn.execute("DELETE FROM zone_revisions")
+            conn.execute("DELETE FROM trip_versions")
+            conn.execute("DELETE FROM revoked_points")
+            conn.execute("DELETE FROM point_corrections")
             conn.execute("DELETE FROM sqlite_sequence WHERE name='zone_revisions'")
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='point_corrections'")

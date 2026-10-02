@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from .config import get_settings
 from .db import Database
-from .schemas import PointBatch, ZoneCreate
+from .schemas import CorrectionBatch, PointBatch, ZoneCreate
 from .service import AuditService, ConflictError, NotFoundError, ValidationError
 
 settings = get_settings()
@@ -26,12 +26,13 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="工地作业车危险区穿越审计服务",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
     description=(
         "登记带洞米制多边形危险区及其 UTC 半开生效时段；每次登记原子产生全局递增修订号，"
         "各区保留不可变历史版本。批量提交车辆轨迹点，按最新配置或指定修订号查询"
-        "各危险区的穿越区间与累计时长。"
+        "各危险区的穿越区间与累计时长。支持现场采集点误录后的整组原子更正"
+        "（撤销/改写、乐观版本、不可变前后值履历），车次轨迹按版本管理。"
     ),
 )
 
@@ -69,7 +70,9 @@ def index() -> dict:
             "GET  /api/v1/revisions",
             "GET  /api/v1/zones/{zone_id}/revisions",
             "POST /api/v1/trips/{trip_id}/points",
+            "POST /api/v1/trips/{trip_id}/corrections",
             "GET  /api/v1/trips/{trip_id}",
+            "GET  /api/v1/trips/{trip_id}/corrections",
             "GET  /api/v1/trips/{trip_id}/crossings",
         ],
     }
@@ -139,32 +142,32 @@ def submit_points(trip_id: str, body: PointBatch) -> dict:
     return result
 
 
+@app.post("/api/v1/trips/{trip_id}/corrections")
+def submit_corrections(trip_id: str, body: CorrectionBatch) -> dict:
+    """现场采集点更正：整组（撤销/改写）在单事务内核对版本、存在性与最终点集同刻唯一。"""
+    return service.correct_points(trip_id, body.model_dump())
+
+
+@app.get("/api/v1/trips/{trip_id}/corrections")
+def get_corrections(trip_id: str) -> JSONResponse:
+    """按车次排列的点更正履历（按版本升序，含不可改前后值）。"""
+    detail = service.list_corrections(trip_id)
+    if detail is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "not_found", "detail": f"车次不存在（无轨迹数据）: {trip_id}"},
+        )
+    return JSONResponse(content=detail)
+
+
 @app.get("/api/v1/trips/{trip_id}")
 def get_trip(trip_id: str) -> JSONResponse:
-    rows = db.list_trip_points(trip_id)
-    if not rows:
+    detail = service.get_trip(trip_id)
+    if detail is None:
         return JSONResponse(
             status_code=404, content={"error": "not_found", "detail": f"车次无轨迹数据: {trip_id}"}
         )
-    from datetime import datetime, timezone
-
-    return JSONResponse(
-        content={
-            "trip_id": trip_id,
-            "point_count": len(rows),
-            "points": [
-                {
-                    "point_id": r["point_id"],
-                    "ts": datetime.fromtimestamp(r["ts_epoch"], timezone.utc)
-                    .isoformat()
-                    .replace("+00:00", "Z"),
-                    "x": r["x"],
-                    "y": r["y"],
-                }
-                for r in rows
-            ],
-        }
-    )
+    return JSONResponse(content=detail)
 
 
 @app.get("/api/v1/trips/{trip_id}/crossings")
